@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from PIL import Image, ImageTk
+from alignment import auto_align
 
 TILE_BYTES = 32
 
@@ -25,6 +26,8 @@ class Studio(tk.Tk):
         self.data=None
         self.path=None
         self.preview=None
+        self.tile_order=None
+        self.tile_order_layout=None
         self.offset=tk.StringVar(value='0x200')
         self.cols=tk.IntVar(value=16)
         self.rows=tk.IntVar(value=16)
@@ -33,7 +36,7 @@ class Studio(tk.Tk):
         self.palette=[(i*17,i*17,i*17) for i in range(16)]
         bar=ttk.Frame(self)
         bar.pack(fill='x',padx=8,pady=8)
-        for name,fn in [('Open ROM',self.open_rom),('Export PNG',self.export_png),('Reimport PNG',self.import_png),('Save Modified ROM',self.save_rom),('Load Palette (.bin)',self.load_palette)]:
+        for name,fn in [('Open ROM',self.open_rom),('Export PNG',self.export_png),('Reimport PNG',self.import_png),('Save Modified ROM',self.save_rom),('Load Palette (.bin)',self.load_palette),('Auto-Align Sprites',self.align_sprites),('Reset Alignment',self.reset_alignment)]:
             ttk.Button(bar,text=name,command=fn).pack(side='left',padx=3)
         opts=ttk.Frame(self)
         opts.pack(fill='x',padx=8,pady=5)
@@ -65,6 +68,8 @@ class Studio(tk.Tk):
             return
         self.data=bytearray(raw)
         self.path=path
+        self.tile_order=None
+        self.tile_order_layout=None
         self.render()
 
     def layout(self):
@@ -80,11 +85,38 @@ class Studio(tk.Tk):
             raise ValueError('Tile selection extends beyond ROM.')
         return start,cols,rows,scale
 
+    def current_order(self):
+        start,cols,rows,_=self.layout()
+        if self.tile_order is not None and self.tile_order_layout==(start,cols,rows):
+            return self.tile_order
+        return list(range(cols*rows))
+
+    def reset_alignment(self):
+        self.tile_order=None
+        self.tile_order_layout=None
+        if self.data is not None:self.render()
+
+    def align_sprites(self):
+        try:
+            start,cols,rows,_=self.layout()
+            count=cols*rows
+            if count>1024:
+                raise ValueError('Select 1024 tiles or fewer for alignment.')
+            tiles=[decode_tile(self.data[start+i*32:start+(i+1)*32]) for i in range(count)]
+            order,before,after=auto_align(tiles,cols)
+            self.tile_order=order
+            self.tile_order_layout=(start,cols,rows)
+            self.render()
+            changed=sum(i!=j for i,j in enumerate(order))
+            self.status.set(f'Heuristic auto-align: {changed} reordered positions; adjacent mismatches {before} → {after}. Review before reimporting. Not compressed/tilemap-aware.')
+        except Exception as e:messagebox.showerror('Auto alignment',str(e))
+
     def make_image(self):
         start,cols,rows,_=self.layout()
         img=Image.new('P',(cols*8,rows*8))
         for j in range(cols*rows):
-            tile=decode_tile(self.data[start+j*32:start+(j+1)*32])
+            tile_index=self.current_order()[j]
+            tile=decode_tile(self.data[start+tile_index*32:start+(tile_index+1)*32])
             x=(j%cols)*8
             y=(j//cols)*8
             for yy in range(8):
@@ -139,12 +171,15 @@ class Studio(tk.Tk):
                     if not set(colors).issubset(lookup):
                         raise ValueError('RGB PNG has colors outside the active 16-color palette.')
                     values=[lookup[c] for c in colors]
-            output=bytearray()
+            output=bytearray(cols*rows*32)
+            order=self.current_order()
             for ty in range(rows):
                 for tx in range(cols):
+                    pos=ty*cols+tx
                     tile=[values[(ty*8+y)*(cols*8)+tx*8+x] for y in range(8) for x in range(8)]
-                    output.extend(encode_tile(tile))
-            if not messagebox.askyesno('Confirm reimport',f'Replace {len(output)} ROM bytes at 0x{start:X}?\nOnly use this on known uncompressed tile regions.'):
+                    original_index=order[pos]
+                    output[original_index*32:(original_index+1)*32]=encode_tile(tile)
+            if not messagebox.askyesno('Confirm reimport',f'Replace {len(output)} ROM bytes at 0x{start:X}?\nOnly use this on known uncompressed tile regions.\nAligned previews are reimported to their original tile indices.'):
                 return
             self.data[start:start+len(output)]=output
             self.render()
